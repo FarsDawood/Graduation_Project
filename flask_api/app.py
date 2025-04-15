@@ -1,68 +1,130 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
+import tensorflow as tf
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import tensorflow as tf
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings("ignore")
+tf.get_logger().setLevel('ERROR')
 
-# إنشاء تطبيق Flask
+# إعداد Flask
 app = Flask(__name__)
-CORS(app)  # لحل مشاكل CORS عند الاتصال من Flutter
+CORS(app)
 
-# 🔹 تحميل البيانات الأصلية لاسترجاع المقياس الحقيقي
+# تحميل البيانات عشان ندرّب الـ Scalers
 data = pd.read_csv("final_dataset.csv")
+data = data.apply(pd.to_numeric, errors='coerce')
 
-# 🔹 تجهيز StandardScaler لإعادة تحويل `predicted_bmi`
+# تحويل Gender إلى 0 و1
+le = LabelEncoder()
+data['Gender'] = le.fit_transform(data['Gender'])
+data.dropna(subset=['Age', 'Height', 'Weight', 'Gender', 'BMI', 'Exercise Recommendation Plan'], inplace=True)
+
+# تحديد فئات BMI
+bins = [-np.inf, 18.5, 24.9, 29.9, np.inf]
+labels = ['Underweight', 'Normal weight', 'Overweight', 'Obese']
+data['BMIcase'] = pd.cut(data['BMI'], bins=bins, labels=labels)
+
+# تجهيز الـ Scaler للـ features
+X = data[['Age', 'Height', 'Weight', 'Gender']].values
+scaler_X = StandardScaler()
+scaler_X.fit(X)
+
+# تجهيز الـ Scaler للـ BMI (مش هنحتاجه دلوقتي لأننا مش بنستخدم Predicted BMI)
+y_bmi = data['BMI'].values
 scaler_bmi = StandardScaler()
-scaler_bmi.fit(data["BMI"].values.reshape(-1, 1))
+scaler_bmi.fit(y_bmi.reshape(-1, 1))
 
-# 🔹 تحميل النماذج الصحيحة
+# تحويل y_exercise_plan لتبدأ من 0
+y_exercise_plan = data['Exercise Recommendation Plan'].values
+y_exercise_plan_adjusted = y_exercise_plan - 4  # تحويل 4->0, 5->1, 6->2, 7->3
+label_encoder_exercise_plan = OneHotEncoder(sparse_output=False)
+label_encoder_exercise_plan.fit(y_exercise_plan_adjusted.reshape(-1, 1))
+
+# تحويل BMIcase إلى One-Hot Encoding
+y_bmicas = data['BMIcase'].values
+label_encoder_bmicas = OneHotEncoder(sparse_output=False)
+label_encoder_bmicas.fit(y_bmicas.reshape(-1, 1))
+
+# تحميل الموديلات
+# استخدمنا model_bmi.keras بدل model_bmi_new.keras
 model_bmi = tf.keras.models.load_model("model_bmi.keras")
-model_bmicas = tf.keras.models.load_model("model_bmicas.keras")
 model_exercise_plan = tf.keras.models.load_model("model_exercise_plan.keras")
-
+model_bmicas = tf.keras.models.load_model("model_bmicas.keras")
 print("✅ تم تحميل النماذج بنجاح!")
 
-# قائمة تصنيفات BMI
-bmi_category_labels = ["Underweight", "Normal weight", "Overweight", "Obese"]
+# دالة التوصيات
+def get_nutrition_and_exercise_recommendations(bmi_case):
+    recommendations = {
+        'nutrition': '',
+        'exercise': ''
+    }
+    if bmi_case == 'Underweight':
+        recommendations['nutrition'] = 'Increase caloric intake with nutritious foods.'
+        recommendations['exercise'] = 'Focus on strength training to build muscle mass.'
+    elif bmi_case == 'Normal weight':
+        recommendations['nutrition'] = 'Maintain a balanced diet with adequate nutrients.'
+        recommendations['exercise'] = 'Continue regular exercise, mixing cardio and strength training.'
+    elif bmi_case == 'Overweight':
+        recommendations['nutrition'] = 'Reduce caloric intake and focus on healthy foods.'
+        recommendations['exercise'] = 'Incorporate regular cardio exercises and strength training.'
+    elif bmi_case == 'Obese':
+        recommendations['nutrition'] = 'Consult a nutritionist for a tailored meal plan.'
+        recommendations['exercise'] = 'Start with low-impact exercises and gradually increase intensity.'
+    return recommendations
 
-# قائمة أسماء خطط التمارين (تحتاج لإضافة التصنيفات الصحيحة)
-exercise_labels = ["Plan A", "Plan B", "Plan C", "Plan D", "Plan E", "Plan F", "Plan G"]
-
+# API Endpoint للتنبؤ
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # استقبال البيانات بصيغة JSON
         data = request.get_json()
 
-        # استخراج المدخلات من JSON
         age = float(data["age"])
-        height = float(data["height"])
+        height = float(data["height"])  # الطول بالمتر (زي الداتا سيت)
         weight = float(data["weight"])
         gender = 1 if data["gender"].lower() == "male" else 0
 
-        # تجهيز البيانات للنموذج (تحويلها إلى الشكل المطلوب)
-        input_data = np.array([[age, height, weight, gender]]).reshape(1, 1, 4)
+        # حساب الـ BMI يدويًا للمقارنة
+        calculated_bmi = weight / (height ** 2)
 
-        # 🔹 إجراء التنبؤات باستخدام النماذج
-        bmi_prediction_scaled = model_bmi.predict(input_data)[0][0]
-        bmi_prediction = scaler_bmi.inverse_transform([[bmi_prediction_scaled]])[0][0]
+        # تجهيز الـ input
+        input_data = np.array([[age, height, weight, gender]])
+        input_data_scaled = scaler_X.transform(input_data)
+        input_data_rnn = np.expand_dims(input_data_scaled, axis=1)  # شكل الـ RNN
 
-        bmicas_prediction = bmi_category_labels[np.argmax(model_bmicas.predict(input_data)[0])]  # اسم تصنيف BMI
-        exercise_plan_prediction = exercise_labels[np.argmax(model_exercise_plan.predict(input_data)[0])]  # اسم خطة التمارين
+        # التنبؤ بـ BMIcase
+        try:
+            bmicas_prediction = model_bmicas.predict(input_data_rnn, verbose=0)
+            predicted_bmicas = label_encoder_bmicas.inverse_transform(bmicas_prediction)[0][0]
+        except Exception as e:
+            return jsonify({"error": f"Failed to predict BMIcase: {str(e)}"}), 500
 
-        # 🔹 تحويل النتائج إلى JSON
+        # التنبؤ بخطة التمارين
+        try:
+            exercise_plan_prediction = model_exercise_plan.predict(input_data_rnn, verbose=0)
+            predicted_exercise_plan_adjusted = label_encoder_exercise_plan.inverse_transform(exercise_plan_prediction)
+            predicted_exercise_plan = int(predicted_exercise_plan_adjusted[0][0]) + 4  # إرجاع القيمة للنطاق الأصلي (4 إلى 7)
+            predicted_exercise_plan = max(4, min(predicted_exercise_plan, 7))  # التأكد من أن القيمة بين 4 و7
+        except Exception as e:
+            return jsonify({"error": f"Failed to predict Exercise Plan: {str(e)}"}), 500
+
+        # الحصول على التوصيات
+        recommendations = get_nutrition_and_exercise_recommendations(predicted_bmicas)
+
+        # إرجاع النتيجة بدون Predicted BMI
         response = {
-            "predicted_bmi": round(float(bmi_prediction), 2),
-            "bmi_category": bmicas_prediction,
-            "exercise_plan": exercise_plan_prediction
+            "Calculated BMI (based on height and weight)": round(float(calculated_bmi), 2),
+            "Predicted BMIcase": predicted_bmicas,
+            "Exercise Plan": predicted_exercise_plan,
+            "Nutrition Recommendation": recommendations['nutrition'],
+            "Exercise Recommendation": recommendations['exercise']
         }
 
         return jsonify(response)
 
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error": str(e)}), 400
 
-# 🔹 تشغيل السيرفر
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)
