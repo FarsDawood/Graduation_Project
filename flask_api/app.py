@@ -124,9 +124,6 @@ def predict():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-# Vercel handler
-def handler(environ, start_response):
-    return app(environ, start_response)
 
 # تشغيل محلي
 if __name__ == '__main__':
